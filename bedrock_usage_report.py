@@ -15,9 +15,6 @@ from datetime import datetime, timezone
 
 import boto3
 
-# CloudWatch clients are not thread-safe; each thread gets its own
-_cw_thread_local = threading.local()
-
 # ANSI color codes for terminal output
 YELLOW = '\033[93m'
 RESET = '\033[0m'
@@ -228,13 +225,8 @@ def extract_model_name(model_arn: str) -> str:
     return model_id.replace("-", " ").title()
 
 
-def _query_logs_for_day(session, log_group: str, start_ms: int, end_ms: int, date_label: str) -> list:
-    """Query CloudWatch Logs for a single day. Uses thread-local client."""
-    import threading as _threading
-    if not hasattr(_cw_thread_local, 'client'):
-        _cw_thread_local.client = session.client('logs')
-    client = _cw_thread_local.client
-
+def _query_logs_for_day(client, log_group: str, start_ms: int, end_ms: int, date_label: str) -> list:
+    """Query CloudWatch Logs for a single day using the provided client."""
     events = []
     next_token = None
     page_count = 0
@@ -270,7 +262,8 @@ def query_logs(session, log_group: str, start_ms: int, end_ms: int,
     Query CloudWatch Logs, parallelized by day.
 
     Each day in the range gets its own filter_log_events pagination chain
-    running in a separate thread. Thread-local clients for safety.
+    running in a separate thread. Clients are created on the main thread
+    upfront since boto3.Session.client() is not thread-safe.
 
     Args:
         session: boto3 Session (NOT a client)
@@ -289,15 +282,20 @@ def query_logs(session, log_group: str, start_ms: int, end_ms: int,
 
     # If no date strings provided, fall back to single sequential query
     if not start_date or not end_date:
-        return _query_logs_for_day(session, log_group, start_ms, end_ms, "all")
+        client = session.client("logs")
+        return _query_logs_for_day(client, log_group, start_ms, end_ms, "all")
 
     dates = generate_date_list(start_date, end_date)
-    print(f"  Querying {len(dates)} days in parallel (workers: {max_workers})")
+    effective_workers = min(max_workers, len(dates))
+    print(f"  Querying {len(dates)} days in parallel (workers: {effective_workers})")
+
+    # Create one client per worker on the main thread (Session.client() is not thread-safe)
+    clients = [session.client("logs") for _ in range(effective_workers)]
 
     all_events = []
     lock = threading.Lock()
 
-    def _day_task(date_str):
+    def _day_task(date_str, client):
         day_start = parse_date_to_epoch_ms(date_str)
         day_end = parse_date_to_epoch_ms(date_str, end_of_day=True)
         # Respect original bounds (incremental updates may shift start_ms)
@@ -305,11 +303,15 @@ def query_logs(session, log_group: str, start_ms: int, end_ms: int,
         effective_end = min(day_end, end_ms)
         if effective_start > effective_end:
             return []
-        return _query_logs_for_day(session, log_group, effective_start, effective_end, date_str)
+        return _query_logs_for_day(client, log_group, effective_start, effective_end, date_str)
 
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_day_task, d): d for d in dates}
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            # Assign each date a client in round-robin; each client used by one thread at a time
+            futures = {}
+            for i, d in enumerate(dates):
+                client = clients[i % effective_workers]
+                futures[pool.submit(_day_task, d, client)] = d
             for future in as_completed(futures):
                 date = futures[future]
                 try:
