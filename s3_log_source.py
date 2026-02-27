@@ -13,15 +13,6 @@ from datetime import datetime, timedelta
 from botocore.exceptions import ClientError
 import sys
 
-# boto3 clients are not thread-safe, so each thread gets its own
-_thread_local = threading.local()
-
-
-def _get_s3_client(session):
-    """Return a per-thread S3 client, creating one if needed."""
-    if not hasattr(_thread_local, 's3_client'):
-        _thread_local.s3_client = session.client('s3')
-    return _thread_local.s3_client
 
 
 def generate_date_prefixes(start_date: str, end_date: str) -> list[str]:
@@ -60,19 +51,18 @@ def _is_log_file(key: str) -> bool:
     return filename.endswith('.json.gz') and '_' in filename and filename[0].isdigit()
 
 
-def list_s3_log_files_for_date(session, bucket: str, full_prefix: str) -> list[str]:
+def list_s3_log_files_for_date(client, bucket: str, full_prefix: str) -> list[str]:
     """
     List all log file keys under a single date prefix.
 
     Args:
-        session: boto3 Session (thread-safe for creating clients)
+        client: boto3 S3 client
         bucket: S3 bucket name
         full_prefix: Full S3 prefix including date (e.g., "AWSLogs/.../2026/02/03/")
 
     Returns:
         List of S3 object keys
     """
-    client = _get_s3_client(session)
     paginator = client.get_paginator('list_objects_v2')
     page_iterator = paginator.paginate(Bucket=bucket, Prefix=full_prefix)
 
@@ -86,15 +76,13 @@ def list_s3_log_files_for_date(session, bucket: str, full_prefix: str) -> list[s
     return keys
 
 
-def _download_and_parse_one(session, bucket: str, key: str) -> list[dict]:
+def _download_and_parse_one(client, bucket: str, key: str) -> list[dict]:
     """
     Download, decompress, and parse a single S3 log file.
-    Uses thread-local S3 client for thread safety.
 
     Returns:
         List of CloudWatch-style event dicts
     """
-    client = _get_s3_client(session)
     try:
         response = client.get_object(Bucket=bucket, Key=key)
         compressed_data = response['Body'].read()
@@ -186,16 +174,18 @@ def query_s3_logs(
 
         date_prefixes = generate_date_prefixes(start_date, end_date)
 
+        # Create all clients on main thread (Session.client() is not thread-safe)
+        effective_workers = min(max_workers, len(date_prefixes)) or 1
+        clients = [session.client('s3') for _ in range(effective_workers)]
+
         # --- Phase 1: list objects for each day in parallel ---
         all_keys = []
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_date = {
-                pool.submit(
-                    list_s3_log_files_for_date,
-                    session, bucket, f"{prefix}/{dp}"
-                ): dp
-                for dp in date_prefixes
-            }
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            future_to_date = {}
+            for i, dp in enumerate(date_prefixes):
+                client = clients[i % effective_workers]
+                f = pool.submit(list_s3_log_files_for_date, client, bucket, f"{prefix}/{dp}")
+                future_to_date[f] = dp
             for future in as_completed(future_to_date):
                 dp = future_to_date[future]
                 try:
@@ -219,8 +209,8 @@ def query_s3_logs(
         lock = threading.Lock()
         downloaded = [0]  # mutable counter for progress
 
-        def _download_task(key):
-            events = _download_and_parse_one(session, bucket, key)
+        def _download_task(client, key):
+            events = _download_and_parse_one(client, bucket, key)
             with lock:
                 all_events.extend(events)
                 downloaded[0] += 1
@@ -230,9 +220,11 @@ def query_s3_logs(
                 print(f"  Downloaded {count}/{total_files} files...")
             return len(events)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_download_task, key) for key in all_keys]
-            # Wait for all to complete; exceptions are captured inside _download_task
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            futures = []
+            for i, key in enumerate(all_keys):
+                client = clients[i % effective_workers]
+                futures.append(pool.submit(_download_task, client, key))
             for future in as_completed(futures):
                 try:
                     future.result()
