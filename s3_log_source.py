@@ -2,13 +2,26 @@
 """
 S3 log source module for querying Bedrock logs stored in S3.
 Handles S3 object listing, downloading, decompression, and parsing.
+Uses ThreadPoolExecutor for parallel S3 operations.
 """
 
 import gzip
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from botocore.exceptions import ClientError
 import sys
+
+# boto3 clients are not thread-safe, so each thread gets its own
+_thread_local = threading.local()
+
+
+def _get_s3_client(session):
+    """Return a per-thread S3 client, creating one if needed."""
+    if not hasattr(_thread_local, 's3_client'):
+        _thread_local.s3_client = session.client('s3')
+    return _thread_local.s3_client
 
 
 def generate_date_prefixes(start_date: str, end_date: str) -> list[str]:
@@ -36,27 +49,96 @@ def generate_date_prefixes(start_date: str, end_date: str) -> list[str]:
     return prefixes
 
 
+def _is_log_file(key: str) -> bool:
+    """Check if an S3 key is a Bedrock log file (not a marker or data file)."""
+    if 'amazon-bedrock-logs-permission-check' in key:
+        return False
+    if '/data/' in key:
+        return False
+    filename = key.split('/')[-1]
+    # Pattern: YYYYMMDDTHHmmssSSSSZ_<hex>.json.gz
+    return filename.endswith('.json.gz') and '_' in filename and filename[0].isdigit()
+
+
+def list_s3_log_files_for_date(session, bucket: str, full_prefix: str) -> list[str]:
+    """
+    List all log file keys under a single date prefix.
+
+    Args:
+        session: boto3 Session (thread-safe for creating clients)
+        bucket: S3 bucket name
+        full_prefix: Full S3 prefix including date (e.g., "AWSLogs/.../2026/02/03/")
+
+    Returns:
+        List of S3 object keys
+    """
+    client = _get_s3_client(session)
+    paginator = client.get_paginator('list_objects_v2')
+    page_iterator = paginator.paginate(Bucket=bucket, Prefix=full_prefix)
+
+    keys = []
+    for page in page_iterator:
+        if 'Contents' not in page:
+            continue
+        for obj in page['Contents']:
+            if _is_log_file(obj['Key']):
+                keys.append(obj['Key'])
+    return keys
+
+
+def _download_and_parse_one(session, bucket: str, key: str) -> list[dict]:
+    """
+    Download, decompress, and parse a single S3 log file.
+    Uses thread-local S3 client for thread safety.
+
+    Returns:
+        List of CloudWatch-style event dicts
+    """
+    client = _get_s3_client(session)
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+        compressed_data = response['Body'].read()
+        decompressed_data = gzip.decompress(compressed_data)
+
+        events = []
+        for line in decompressed_data.decode('utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            timestamp = entry.get('timestamp', 0)
+            if isinstance(timestamp, str):
+                try:
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    timestamp = int(dt.timestamp() * 1000)
+                except Exception:
+                    timestamp = 0
+
+            events.append({
+                'timestamp': timestamp,
+                'message': json.dumps(entry)
+            })
+        return events
+    except Exception as e:
+        print(f"  Warning: Failed to process {key}: {e}")
+        return []
+
+
+# Keep the old signature working for any external callers
 def download_and_parse_s3_log(client, bucket: str, key: str) -> list:
     """
     Download, decompress, and parse a single S3 log file.
-
-    Args:
-        client: boto3 S3 client
-        bucket: S3 bucket name
-        key: S3 object key
-
-    Returns:
-        List of parsed log entries
+    Legacy wrapper — prefers _download_and_parse_one for parallel use.
     """
     try:
-        # GetObject from S3
         response = client.get_object(Bucket=bucket, Key=key)
         compressed_data = response['Body'].read()
-
-        # Decompress with gzip
         decompressed_data = gzip.decompress(compressed_data)
 
-        # Parse JSON Lines (one JSON object per line)
         log_entries = []
         for line in decompressed_data.decode('utf-8').splitlines():
             line = line.strip()
@@ -66,9 +148,7 @@ def download_and_parse_s3_log(client, bucket: str, key: str) -> list:
                 log_entry = json.loads(line)
                 log_entries.append(log_entry)
             except json.JSONDecodeError:
-                # Skip malformed lines
                 continue
-
         return log_entries
     except Exception as e:
         print(f"  Warning: Failed to process {key}: {e}")
@@ -76,21 +156,27 @@ def download_and_parse_s3_log(client, bucket: str, key: str) -> list:
 
 
 def query_s3_logs(
-    client,
+    session,
     bucket: str,
     prefix: str,
     start_date: str,
-    end_date: str
+    end_date: str,
+    max_workers: int = 10
 ) -> list:
     """
-    Query S3 logs within date range using path prefixes.
+    Query S3 logs within date range using parallel downloads.
+
+    Two-phase approach:
+      Phase 1 — list objects for all days in parallel
+      Phase 2 — download + decompress + parse all files in parallel
 
     Args:
-        client: boto3 S3 client
+        session: boto3 Session (NOT a client — threads create their own clients)
         bucket: S3 bucket name
         prefix: Base prefix (e.g., "AWSLogs/ACCOUNT/BedrockModelInvocationLogs/REGION")
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
+        max_workers: Thread pool size (default 10)
 
     Returns:
         List of log events in same format as CloudWatch logs
@@ -98,73 +184,60 @@ def query_s3_logs(
     try:
         print(f"Querying S3 logs from s3://{bucket}/{prefix}")
 
-        # Generate date prefixes to query
         date_prefixes = generate_date_prefixes(start_date, end_date)
 
-        all_events = []
-        total_files = 0
-
-        for date_prefix in date_prefixes:
-            # Full prefix for this date
-            full_prefix = f"{prefix}/{date_prefix}"
-
-            # List objects under this date prefix
-            paginator = client.get_paginator('list_objects_v2')
-            page_iterator = paginator.paginate(
-                Bucket=bucket,
-                Prefix=full_prefix
-            )
-
-            log_files = []
-            for page in page_iterator:
-                if 'Contents' not in page:
+        # --- Phase 1: list objects for each day in parallel ---
+        all_keys = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_date = {
+                pool.submit(
+                    list_s3_log_files_for_date,
+                    session, bucket, f"{prefix}/{dp}"
+                ): dp
+                for dp in date_prefixes
+            }
+            for future in as_completed(future_to_date):
+                dp = future_to_date[future]
+                try:
+                    keys = future.result()
+                except Exception as exc:
+                    print(f"  Warning: listing failed for {dp}: {exc}")
                     continue
+                if keys:
+                    print(f"  Date {dp.rstrip('/')}: found {len(keys)} log files")
+                    all_keys.extend(keys)
 
-                for obj in page['Contents']:
-                    key = obj['Key']
+        total_files = len(all_keys)
+        if total_files == 0:
+            print("Query complete. No log files found.")
+            return []
 
-                    # Skip permission check marker files
-                    if 'amazon-bedrock-logs-permission-check' in key:
-                        continue
+        print(f"  Total files to download: {total_files}")
 
-                    # Skip data/ subdirectory (contains input files only)
-                    if '/data/' in key:
-                        continue
+        # --- Phase 2: download + parse all files in parallel ---
+        all_events = []
+        lock = threading.Lock()
+        downloaded = [0]  # mutable counter for progress
 
-                    # Only process main log files matching pattern
-                    # Pattern: YYYYMMDDTHHmmssSSSSZ_<hex>.json.gz
-                    filename = key.split('/')[-1]
-                    if filename.endswith('.json.gz') and '_' in filename:
-                        # Basic check: starts with digit and has timestamp format
-                        if filename[0].isdigit():
-                            log_files.append(key)
+        def _download_task(key):
+            events = _download_and_parse_one(session, bucket, key)
+            with lock:
+                all_events.extend(events)
+                downloaded[0] += 1
+                count = downloaded[0]
+            # Progress every 50 files
+            if count % 50 == 0:
+                print(f"  Downloaded {count}/{total_files} files...")
+            return len(events)
 
-            if log_files:
-                print(f"  Date {date_prefix.rstrip('/')}: found {len(log_files)} log files")
-                total_files += len(log_files)
-
-                # Download and parse each log file
-                for key in log_files:
-                    log_entries = download_and_parse_s3_log(client, bucket, key)
-
-                    # Convert to CloudWatch-style events format
-                    for entry in log_entries:
-                        # Extract timestamp if available, otherwise use 0
-                        timestamp = entry.get('timestamp', 0)
-                        if isinstance(timestamp, str):
-                            # Parse ISO timestamp if needed
-                            try:
-                                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                                timestamp = int(dt.timestamp() * 1000)
-                            except:
-                                timestamp = 0
-
-                        # Create CloudWatch-style event
-                        event = {
-                            'timestamp': timestamp,
-                            'message': json.dumps(entry)
-                        }
-                        all_events.append(event)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_download_task, key) for key in all_keys]
+            # Wait for all to complete; exceptions are captured inside _download_task
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"  Warning: download task failed: {exc}")
 
         print(f"Query complete. Processed {total_files} files, found {len(all_events)} log entries.")
         return all_events

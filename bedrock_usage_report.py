@@ -42,18 +42,18 @@ def parse_args():
     )
     parser.add_argument(
         "--log-group",
-        default="BedrockLogging6",
-        help="CloudWatch log group name (default: BedrockLogging6)",
+        default="BedrockModelInvocationLogging",
+        help="CloudWatch log group name (default: BedrockModelInvocationLogging)",
     )
     parser.add_argument(
         "--s3-bucket",
-        default="aytm-bedrock-logs",
-        help="S3 bucket name for Bedrock logs (default: aytm-bedrock-logs)",
+        default="your-bedrock-logs-bucket",
+        help="S3 bucket name for Bedrock logs",
     )
     parser.add_argument(
         "--s3-prefix",
-        default="AWSLogs/023788696405/BedrockModelInvocationLogs",
-        help="S3 prefix for Bedrock logs (default: AWSLogs/023788696405/BedrockModelInvocationLogs)",
+        default="AWSLogs/123456789012/BedrockModelInvocationLogs",
+        help="S3 prefix for Bedrock logs (default: AWSLogs/<account-id>/BedrockModelInvocationLogs)",
     )
     parser.add_argument(
         "--start-date",
@@ -136,6 +136,12 @@ def parse_args():
         "--summary-only",
         action="store_true",
         help="Show only per-user totals without per-model breakdown (default: show detailed per-model breakdown)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel threads for S3 downloads (default: 10)",
     )
     return parser.parse_args()
 
@@ -1226,13 +1232,13 @@ def main():
                 client = session.client("logs")
                 log_results = query_logs(client, args.log_group, start_ms, end_ms)
             elif source == "s3":
-                client = session.client("s3")
                 log_results = query_s3_logs(
-                    client,
+                    session,
                     args.s3_bucket,
                     f"{args.s3_prefix}/{args.region}",
                     query_start,
-                    query_end
+                    query_end,
+                    max_workers=args.workers
                 )
 
             if not log_results:
