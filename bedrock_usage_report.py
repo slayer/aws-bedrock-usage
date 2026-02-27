@@ -8,11 +8,15 @@ import argparse
 import csv
 import json
 import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
 import boto3
+
+# CloudWatch clients are not thread-safe; each thread gets its own
+_cw_thread_local = threading.local()
 
 # ANSI color codes for terminal output
 YELLOW = '\033[93m'
@@ -141,7 +145,7 @@ def parse_args():
         "--workers",
         type=int,
         default=10,
-        help="Number of parallel threads for S3 downloads (default: 10)",
+        help="Number of parallel threads for S3 and CloudWatch queries (default: 10)",
     )
     return parser.parse_args()
 
@@ -224,37 +228,106 @@ def extract_model_name(model_arn: str) -> str:
     return model_id.replace("-", " ").title()
 
 
-def query_logs(client, log_group: str, start_ms: int, end_ms: int) -> list:
-    """Query CloudWatch Logs using filter_log_events with pagination."""
-    from botocore.exceptions import ClientError
+def _query_logs_for_day(session, log_group: str, start_ms: int, end_ms: int, date_label: str) -> list:
+    """Query CloudWatch Logs for a single day. Uses thread-local client."""
+    import threading as _threading
+    if not hasattr(_cw_thread_local, 'client'):
+        _cw_thread_local.client = session.client('logs')
+    client = _cw_thread_local.client
 
-    print(f"Querying CloudWatch Logs from {log_group}...")
-
-    all_events = []
+    events = []
     next_token = None
     page_count = 0
 
+    while True:
+        page_count += 1
+        kwargs = {
+            "logGroupName": log_group,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "filterPattern": "inputTokenCount",
+        }
+        if next_token:
+            kwargs["nextToken"] = next_token
+
+        response = client.filter_log_events(**kwargs)
+        page_events = response.get("events", [])
+        events.extend(page_events)
+
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+
+    if events:
+        print(f"  {date_label}: {len(events)} events ({page_count} pages)")
+    return events
+
+
+def query_logs(session, log_group: str, start_ms: int, end_ms: int,
+               start_date: str = None, end_date: str = None,
+               max_workers: int = 10) -> list:
+    """
+    Query CloudWatch Logs, parallelized by day.
+
+    Each day in the range gets its own filter_log_events pagination chain
+    running in a separate thread. Thread-local clients for safety.
+
+    Args:
+        session: boto3 Session (NOT a client)
+        log_group: CloudWatch log group name
+        start_ms: Start time epoch ms (used as fallback if dates not provided)
+        end_ms: End time epoch ms (used as fallback if dates not provided)
+        start_date: Start date YYYY-MM-DD (enables per-day parallelism)
+        end_date: End date YYYY-MM-DD (enables per-day parallelism)
+        max_workers: Thread pool size
+    """
+    from botocore.exceptions import ClientError
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    print(f"Querying CloudWatch Logs from {log_group}...")
+
+    # If no date strings provided, fall back to single sequential query
+    if not start_date or not end_date:
+        return _query_logs_for_day(session, log_group, start_ms, end_ms, "all")
+
+    dates = generate_date_list(start_date, end_date)
+    print(f"  Querying {len(dates)} days in parallel (workers: {max_workers})")
+
+    all_events = []
+    lock = threading.Lock()
+
+    def _day_task(date_str):
+        day_start = parse_date_to_epoch_ms(date_str)
+        day_end = parse_date_to_epoch_ms(date_str, end_of_day=True)
+        # Respect original bounds (incremental updates may shift start_ms)
+        effective_start = max(day_start, start_ms)
+        effective_end = min(day_end, end_ms)
+        if effective_start > effective_end:
+            return []
+        return _query_logs_for_day(session, log_group, effective_start, effective_end, date_str)
+
     try:
-        while True:
-            page_count += 1
-            kwargs = {
-                "logGroupName": log_group,
-                "startTime": start_ms,
-                "endTime": end_ms,
-                "filterPattern": "inputTokenCount",  # Filter for Bedrock logs
-            }
-            if next_token:
-                kwargs["nextToken"] = next_token
-
-            response = client.filter_log_events(**kwargs)
-            events = response.get("events", [])
-            all_events.extend(events)
-
-            print(f"  Page {page_count}: retrieved {len(events)} events (total: {len(all_events)})")
-
-            next_token = response.get("nextToken")
-            if not next_token:
-                break
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_day_task, d): d for d in dates}
+            for future in as_completed(futures):
+                date = futures[future]
+                try:
+                    events = future.result()
+                    if events:
+                        with lock:
+                            all_events.extend(events)
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code", "")
+                    if error_code == "AccessDeniedException":
+                        print(f"\nERROR: Access denied. Your IAM user/role needs these permissions:")
+                        print("  - logs:FilterLogEvents")
+                        print(f"  on resource: arn:aws:logs:*:*:log-group:{log_group}:*")
+                        print("\nTry using a different --profile with appropriate permissions.")
+                        sys.exit(1)
+                    raise
+                except Exception as exc:
+                    print(f"  Warning: query failed for {date}: {exc}")
     except ClientError as e:
         error_code = e.response.get("Error", {}).get("Code", "")
         if error_code == "AccessDeniedException":
@@ -1229,8 +1302,11 @@ def main():
                 start_ms = earliest_fetch
 
             if source == "cloudwatch":
-                client = session.client("logs")
-                log_results = query_logs(client, args.log_group, start_ms, end_ms)
+                log_results = query_logs(
+                    session, args.log_group, start_ms, end_ms,
+                    start_date=query_start, end_date=query_end,
+                    max_workers=args.workers
+                )
             elif source == "s3":
                 log_results = query_s3_logs(
                     session,

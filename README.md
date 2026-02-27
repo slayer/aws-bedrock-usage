@@ -7,6 +7,7 @@ Each report row shows a specific user-model combination with input/output/cache 
 ## Features
 
 - **Dual log sources**: Query logs from S3 (default), CloudWatch, or both
+- **Parallel downloads**: Threaded S3 and CloudWatch queries for ~10x faster data fetching
 - **Per-model breakdown**: Token usage split by model for each IAM user
 - **Cost estimation**: Automatic cost calculation via AWS Pricing API with local caching
 - **Flexible output**: Formatted ASCII table (default) or CSV export
@@ -112,6 +113,26 @@ python bedrock_usage_report.py \
 Pricing sources: AWS Pricing API (primary, cached for 24h) with [LiteLLM](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json) fallback for newer models.
 
 > Costs are estimates based on list prices. Actual billing may differ due to discounts, credits, or reserved capacity.
+
+### Parallel downloads
+
+Both S3 and CloudWatch queries run in parallel using a thread pool (default: 10 workers). S3 parallelizes listing and downloading; CloudWatch parallelizes by querying each day independently. Control with `--workers`:
+
+```bash
+# Faster downloads with more threads
+python bedrock_usage_report.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --workers 20
+
+# Sequential mode (useful for debugging)
+python bedrock_usage_report.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --workers 1
+```
 
 ### Cache management
 

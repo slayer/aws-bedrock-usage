@@ -16,7 +16,7 @@ source venv/bin/activate
 
 **Quick start**: Activate virtual environment and run the script:
 ```bash
-source venv/bin/activate && python bedrock_usage_report.py --start-date 2025-01-01 --end-date 2025-01-31 --profile aytm
+source venv/bin/activate && python bedrock_usage_report.py --start-date 2025-01-01 --end-date 2025-01-31 --profile <aws-profile>
 ```
 
 **Default behavior**: Outputs a formatted ASCII table to stdout.
@@ -28,7 +28,7 @@ source venv/bin/activate && python bedrock_usage_report.py --start-date 2025-01-
 python bedrock_usage_report.py \
   --start-date 2025-01-01 \
   --end-date 2025-01-31 \
-  --profile aytm
+  --profile <aws-profile>
 ```
 
 ### CSV export with default filename
@@ -36,7 +36,7 @@ python bedrock_usage_report.py \
 python bedrock_usage_report.py \
   --start-date 2025-01-01 \
   --end-date 2025-01-31 \
-  --profile aytm \
+  --profile <aws-profile> \
   --csv
 # Creates: 2025-01-01_to_2025-01-31_usage_report.csv
 ```
@@ -46,7 +46,7 @@ python bedrock_usage_report.py \
 python bedrock_usage_report.py \
   --start-date 2025-01-01 \
   --end-date 2025-01-31 \
-  --profile aytm \
+  --profile <aws-profile> \
   --csv \
   --output my_report.csv
 # Creates: 2025-01-01_to_2025-01-31_my_report.csv
@@ -67,7 +67,7 @@ python bedrock_usage_report.py \
   --start-date 2025-01-01 \
   --end-date 2025-01-31 \
   --source both \
-  --profile aytm
+  --profile <aws-profile>
 ```
 
 ### Custom S3 bucket/prefix
@@ -78,7 +78,7 @@ python bedrock_usage_report.py \
   --source s3 \
   --s3-bucket my-bucket \
   --s3-prefix AWSLogs/123456789012/BedrockModelInvocationLogs \
-  --profile aytm
+  --profile <aws-profile>
 ```
 
 ### Cost Calculation
@@ -90,13 +90,13 @@ python bedrock_usage_report.py \
 python bedrock_usage_report.py \
   --start-date 2025-01-01 \
   --end-date 2025-01-31 \
-  --profile aytm
+  --profile <aws-profile>
 
 # Disable costs if not needed
 python bedrock_usage_report.py \
   --start-date 2025-01-01 \
   --end-date 2025-01-31 \
-  --profile aytm \
+  --profile <aws-profile> \
   --no-costs
 ```
 
@@ -120,6 +120,17 @@ AWS Pricing API is only available in certain regions. Use `--pricing-region` to 
 Models with fallback pricing include: Claude Opus 4.5, Claude Haiku 4.5, Claude 3.5 Haiku, and other models. The LiteLLM database is community-maintained and reflects actual AWS Bedrock pricing.
 
 **Note:** Costs are estimates based on AWS list prices and may not reflect your actual AWS bill (which may include discounts, credits, reserved capacity, etc.).
+
+### Parallel downloads
+
+Both S3 and CloudWatch queries run in parallel threads (default: 10 workers). S3 parallelizes listing + downloading; CloudWatch queries each day independently. Use `--workers` to tune:
+```bash
+python bedrock_usage_report.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --workers 20
+```
 
 ### Cache management
 ```bash
@@ -206,14 +217,14 @@ Each day is cached independently in its own file. This means:
 ## AWS Requirements
 
 ### For CloudWatch Logs
-The IAM user/role needs `logs:FilterLogEvents` permission on the target log group (default: `BedrockLogging6`).
+The IAM user/role needs `logs:FilterLogEvents` permission on the target log group (default: `BedrockModelInvocationLogging`).
 
 ### For S3 Logs (default)
 The IAM user/role needs:
 - `s3:ListBucket` on the bucket
 - `s3:GetObject` on objects under the prefix
 
-Default S3 location: `s3://aytm-bedrock-logs/AWSLogs/023788696405/BedrockModelInvocationLogs/us-east-1/`
+Default S3 location: `s3://<your-bucket>/AWSLogs/<account-id>/BedrockModelInvocationLogs/<region>/`
 
 ### For Pricing API (optional, for --show-costs)
 The IAM user/role needs `pricing:GetProducts` permission.
