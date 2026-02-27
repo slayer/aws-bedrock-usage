@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(python bedrock_usage_report.py:*)",
+      "Bash(python:*)",
+      "Bash(aws s3 ls:*)",
+      "Bash(gunzip:*)",
+      "Bash(aws s3 cp:*)",
+      "WebFetch(domain:aws.amazon.com)",
+      "WebFetch(domain:pricing.us-east-1.amazonaws.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl:*)",
+      "Bash(gtimeout 30 curl:*)",
+      "Bash(aws pricing:*)",
+      "WebFetch(domain:www.anthropic.com)",
+      "WebFetch(domain:claude.com)"
+    ]
+  }
+}

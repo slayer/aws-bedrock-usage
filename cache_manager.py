@@ -275,10 +275,15 @@ def read_summary_cache_for_range(
                     data = json.load(f)
                 day_usage = data.get("usage", {})
 
-                # Convert models_used from list back to set
-                for metrics in day_usage.values():
-                    if "models_used" in metrics:
-                        metrics["models_used"] = set(metrics["models_used"])
+                # Convert serialized data back to proper structure
+                for arn, arn_data in day_usage.items():
+                    # Handle both old and new cache format
+                    if "totals" in arn_data:
+                        # New format with per-model breakdown
+                        arn_data["totals"]["models_used"] = set(arn_data["totals"]["models_used"])
+                    else:
+                        # Old format - skip or convert (skip for now)
+                        continue
 
                 # Merge into accumulated usage
                 merged_usage = merge_usage_dicts(merged_usage, day_usage)
@@ -311,13 +316,20 @@ def write_summary_cache_by_day(
     for date, usage in usage_by_day.items():
         cache_file = cache_dir / f"{date}.json"
 
-        # Convert models_used from set to list for JSON serialization
+        # Convert to JSON-serializable format
         usage_serializable = {}
-        for arn, metrics in usage.items():
-            metrics_copy = metrics.copy()
-            if "models_used" in metrics_copy:
-                metrics_copy["models_used"] = sorted(list(metrics_copy["models_used"]))
-            usage_serializable[arn] = metrics_copy
+        for arn, arn_data in usage.items():
+            # Convert models dict (which may be defaultdict) to regular dict
+            models_dict = dict(arn_data["models"])
+
+            # Convert totals and models_used set to list
+            totals = arn_data["totals"].copy()
+            totals["models_used"] = sorted(list(totals["models_used"]))
+
+            usage_serializable[arn] = {
+                "models": models_dict,
+                "totals": totals
+            }
 
         cache_data = {
             "metadata": {
@@ -336,7 +348,7 @@ def write_summary_cache_by_day(
 
 def merge_usage_dicts(usage1: dict, usage2: dict) -> dict:
     """
-    Merge two usage dicts (same logic as merge_usage in main script).
+    Merge two usage dicts with per-model breakdown.
 
     Args:
         usage1: First usage dict
@@ -345,33 +357,70 @@ def merge_usage_dicts(usage1: dict, usage2: dict) -> dict:
     Returns:
         Merged usage dict with summed metrics
     """
-    result = dict(usage1)
+    result = {}
 
-    for arn, metrics in usage2.items():
-        if arn in result:
-            result[arn]["total_input_tokens"] += metrics["total_input_tokens"]
-            result[arn]["total_output_tokens"] += metrics["total_output_tokens"]
-            result[arn]["cache_read_tokens"] += metrics["cache_read_tokens"]
-            result[arn]["cache_write_tokens"] += metrics["cache_write_tokens"]
-            result[arn]["request_count"] += metrics["request_count"]
-            # Union models_used (handle both set and list)
-            models1 = result[arn]["models_used"]
-            models2 = metrics["models_used"]
-            if isinstance(models1, set):
-                if isinstance(models2, set):
-                    result[arn]["models_used"] = models1.union(models2)
-                else:
-                    result[arn]["models_used"] = models1.union(set(models2))
-            else:
-                # Convert both to sets
-                result[arn]["models_used"] = set(models1).union(set(models2))
+    # Copy usage1 data
+    for arn, arn_data in usage1.items():
+        result[arn] = {
+            "models": defaultdict(
+                lambda: {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "request_count": 0,
+                }
+            ),
+            "totals": arn_data["totals"].copy()
+        }
+        # Ensure models_used is a set
+        result[arn]["totals"]["models_used"] = set(arn_data["totals"]["models_used"])
+
+        # Copy per-model data
+        for model_id, model_metrics in arn_data["models"].items():
+            result[arn]["models"][model_id] = model_metrics.copy()
+
+    # Merge usage2 into result
+    for arn, arn_data in usage2.items():
+        if arn not in result:
+            result[arn] = {
+                "models": defaultdict(
+                    lambda: {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "request_count": 0,
+                    }
+                ),
+                "totals": arn_data["totals"].copy()
+            }
+            result[arn]["totals"]["models_used"] = set(arn_data["totals"]["models_used"])
+
+            # Copy per-model data
+            for model_id, model_metrics in arn_data["models"].items():
+                result[arn]["models"][model_id] = model_metrics.copy()
         else:
-            result[arn] = metrics.copy()
-            # Ensure models_used is a set
-            if isinstance(metrics["models_used"], list):
-                result[arn]["models_used"] = set(metrics["models_used"])
-            else:
-                result[arn]["models_used"] = set(metrics["models_used"])
+            # Merge per-model stats
+            for model_id, model_metrics in arn_data["models"].items():
+                if model_id in result[arn]["models"]:
+                    result[arn]["models"][model_id]["input_tokens"] += model_metrics["input_tokens"]
+                    result[arn]["models"][model_id]["output_tokens"] += model_metrics["output_tokens"]
+                    result[arn]["models"][model_id]["cache_read_tokens"] += model_metrics["cache_read_tokens"]
+                    result[arn]["models"][model_id]["cache_write_tokens"] += model_metrics["cache_write_tokens"]
+                    result[arn]["models"][model_id]["request_count"] += model_metrics["request_count"]
+                else:
+                    result[arn]["models"][model_id] = model_metrics.copy()
+
+            # Merge totals
+            result[arn]["totals"]["total_input_tokens"] += arn_data["totals"]["total_input_tokens"]
+            result[arn]["totals"]["total_output_tokens"] += arn_data["totals"]["total_output_tokens"]
+            result[arn]["totals"]["cache_read_tokens"] += arn_data["totals"]["cache_read_tokens"]
+            result[arn]["totals"]["cache_write_tokens"] += arn_data["totals"]["cache_write_tokens"]
+            result[arn]["totals"]["request_count"] += arn_data["totals"]["request_count"]
+            result[arn]["totals"]["models_used"] = result[arn]["totals"]["models_used"].union(
+                set(arn_data["totals"]["models_used"])
+            )
 
     return result
 

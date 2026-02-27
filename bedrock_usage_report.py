@@ -14,6 +14,10 @@ from datetime import datetime, timezone
 
 import boto3
 
+# ANSI color codes for terminal output
+YELLOW = '\033[93m'
+RESET = '\033[0m'
+
 from cache_manager import (
     read_full_cache_for_range,
     write_full_cache_by_day,
@@ -70,9 +74,14 @@ def parse_args():
         help="AWS region (default: us-east-1)",
     )
     parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="Write output to CSV file (default: print ASCII table to stdout)",
+    )
+    parser.add_argument(
         "--output",
         default="usage_report.csv",
-        help="Output CSV file path (default: usage_report.csv)",
+        help="CSV file path when --csv is used (default: usage_report.csv). Filename will be prefixed with date range.",
     )
     parser.add_argument(
         "--no-cache",
@@ -88,6 +97,45 @@ def parse_args():
         "--clear-all-cache",
         action="store_true",
         help="Clear all cache (full and summary) and exit",
+    )
+    parser.add_argument(
+        "--show-costs",
+        action="store_true",
+        default=True,
+        help="Enable cost calculation and display (default: enabled, requires pricing data)",
+    )
+    parser.add_argument(
+        "--no-costs",
+        action="store_false",
+        dest="show_costs",
+        help="Disable cost calculation and display",
+    )
+    parser.add_argument(
+        "--pricing-region",
+        default="us-east-1",
+        choices=["us-east-1", "eu-central-1", "ap-south-1"],
+        help="AWS region for Pricing API queries (default: us-east-1)",
+    )
+    parser.add_argument(
+        "--refresh-pricing",
+        action="store_true",
+        help="Force refresh pricing cache from AWS Pricing API",
+    )
+    parser.add_argument(
+        "--pricing-cache-ttl",
+        type=int,
+        default=24,
+        help="Pricing cache TTL in hours (default: 24)",
+    )
+    parser.add_argument(
+        "--clear-pricing-cache",
+        action="store_true",
+        help="Clear pricing cache and exit",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Show only per-user totals without per-model breakdown (default: show detailed per-model breakdown)",
     )
     return parser.parse_args()
 
@@ -111,6 +159,63 @@ def extract_username(arn: str) -> str:
         parts = arn.split("/")
         return f"{parts[-2]}/{parts[-1]}"  # role-name/session-name
     return arn.split("/")[-1]
+
+
+def extract_model_name(model_arn: str) -> str:
+    """
+    Extract human-readable model name from Bedrock model ARN.
+
+    Examples:
+        arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+        -> Claude Sonnet 4.5
+
+        arn:aws:bedrock:region:account:inference-profile/global.anthropic.claude-opus-4-5-20251101-v1:0
+        -> Claude Opus 4.5
+
+        arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0
+        -> Claude 3.5 Haiku
+    """
+    # Extract the model ID from ARN
+    if "/inference-profile/" in model_arn:
+        model_id = model_arn.split("/inference-profile/")[-1]
+    else:
+        model_id = model_arn.split("/")[-1] if "/" in model_arn else model_arn
+
+    # Remove region prefix (us., global., etc.) and provider (anthropic.)
+    model_id = model_id.split(".")[-1] if "." in model_id else model_id
+
+    # Parse Claude model names
+    if "claude" in model_id.lower():
+        # Extract model variant and version
+        parts = model_id.lower().replace("claude-", "").split("-")
+
+        # Handle different naming patterns
+        if len(parts) >= 2:
+            # Check for version number patterns like "3-5" or "4-5"
+            if parts[0].isdigit() and len(parts[0]) == 1 and parts[1].isdigit() and len(parts[1]) == 1:
+                # Format: claude-3-5-haiku or claude-4-5
+                version = f"{parts[0]}.{parts[1]}"
+                variant = parts[2].title() if len(parts) > 2 and parts[2].isalpha() else ""
+                if variant:
+                    return f"Claude {version} {variant}"
+                else:
+                    return f"Claude {version}"
+            elif parts[0].isalpha():
+                # Format: claude-sonnet-4-5 or claude-opus-4-5 or claude-sonnet-4-20250514
+                variant = parts[0].title()
+                if len(parts) >= 3 and parts[1].isdigit() and len(parts[1]) == 1 and parts[2].isdigit() and len(parts[2]) == 1:
+                    # Version format: 4-5
+                    version = f"{parts[1]}.{parts[2]}"
+                    return f"Claude {variant} {version}"
+                elif len(parts) >= 2 and parts[1].isdigit():
+                    # Version format: 4 or 4-20250514 (just use major version)
+                    version = parts[1]
+                    return f"Claude {variant} {version}"
+                else:
+                    return f"Claude {variant}"
+
+    # Fallback: return the model ID with basic cleanup
+    return model_id.replace("-", " ").title()
 
 
 def query_logs(client, log_group: str, start_ms: int, end_ms: int) -> list:
@@ -182,21 +287,55 @@ def process_log_entry(message: str) -> dict | None:
 
 
 def aggregate_usage(log_results: list) -> dict:
-    """Aggregate usage statistics by user ARN."""
-    # Structure: {arn: {metrics}}
+    """
+    Aggregate usage statistics by user ARN and model.
+
+    Returns structure:
+    {
+        arn: {
+            "models": {
+                model_id: {
+                    "input_tokens": int,
+                    "output_tokens": int,
+                    "cache_read_tokens": int,
+                    "cache_write_tokens": int,
+                    "request_count": int
+                }
+            },
+            "totals": {
+                "total_input_tokens": int,
+                "total_output_tokens": int,
+                "cache_read_tokens": int,
+                "cache_write_tokens": int,
+                "request_count": int,
+                "models_used": set
+            }
+        }
+    }
+    """
     usage = defaultdict(
         lambda: {
-            "total_input_tokens": 0,
-            "total_output_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-            "request_count": 0,
-            "models_used": set(),
+            "models": defaultdict(
+                lambda: {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "request_count": 0,
+                }
+            ),
+            "totals": {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "request_count": 0,
+                "models_used": set(),
+            }
         }
     )
 
     for event in log_results:
-        # filter_log_events returns events with 'message' field directly
         message = event.get("message")
         if not message:
             continue
@@ -206,12 +345,22 @@ def aggregate_usage(log_results: list) -> dict:
             continue
 
         arn = entry["arn"]
-        usage[arn]["total_input_tokens"] += entry["input_tokens"]
-        usage[arn]["total_output_tokens"] += entry["output_tokens"]
-        usage[arn]["cache_read_tokens"] += entry["cache_read_tokens"]
-        usage[arn]["cache_write_tokens"] += entry["cache_write_tokens"]
-        usage[arn]["request_count"] += 1
-        usage[arn]["models_used"].add(entry["model_id"])
+        model_id = entry["model_id"]
+
+        # Update per-model stats
+        usage[arn]["models"][model_id]["input_tokens"] += entry["input_tokens"]
+        usage[arn]["models"][model_id]["output_tokens"] += entry["output_tokens"]
+        usage[arn]["models"][model_id]["cache_read_tokens"] += entry["cache_read_tokens"]
+        usage[arn]["models"][model_id]["cache_write_tokens"] += entry["cache_write_tokens"]
+        usage[arn]["models"][model_id]["request_count"] += 1
+
+        # Update totals
+        usage[arn]["totals"]["total_input_tokens"] += entry["input_tokens"]
+        usage[arn]["totals"]["total_output_tokens"] += entry["output_tokens"]
+        usage[arn]["totals"]["cache_read_tokens"] += entry["cache_read_tokens"]
+        usage[arn]["totals"]["cache_write_tokens"] += entry["cache_write_tokens"]
+        usage[arn]["totals"]["request_count"] += 1
+        usage[arn]["totals"]["models_used"].add(model_id)
 
     return usage
 
@@ -227,21 +376,70 @@ def merge_usage(usage1: dict, usage2: dict) -> dict:
     Returns:
         Merged usage dict with summed metrics
     """
-    result = dict(usage1)  # Copy
+    result = {}
 
-    for arn, metrics in usage2.items():
-        if arn in result:
-            # Sum tokens
-            result[arn]["total_input_tokens"] += metrics["total_input_tokens"]
-            result[arn]["total_output_tokens"] += metrics["total_output_tokens"]
-            result[arn]["cache_read_tokens"] += metrics["cache_read_tokens"]
-            result[arn]["cache_write_tokens"] += metrics["cache_write_tokens"]
-            result[arn]["request_count"] += metrics["request_count"]
-            # Union models
-            result[arn]["models_used"] = result[arn]["models_used"].union(metrics["models_used"])
+    # Copy usage1 data
+    for arn, data in usage1.items():
+        result[arn] = {
+            "models": defaultdict(
+                lambda: {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "request_count": 0,
+                }
+            ),
+            "totals": data["totals"].copy()
+        }
+        # Ensure models_used is a set
+        result[arn]["totals"]["models_used"] = set(data["totals"]["models_used"])
+
+        # Copy per-model data
+        for model_id, model_metrics in data["models"].items():
+            result[arn]["models"][model_id] = model_metrics.copy()
+
+    # Merge usage2 into result
+    for arn, data in usage2.items():
+        if arn not in result:
+            result[arn] = {
+                "models": defaultdict(
+                    lambda: {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "request_count": 0,
+                    }
+                ),
+                "totals": data["totals"].copy()
+            }
+            result[arn]["totals"]["models_used"] = set(data["totals"]["models_used"])
+
+            # Copy per-model data
+            for model_id, model_metrics in data["models"].items():
+                result[arn]["models"][model_id] = model_metrics.copy()
         else:
-            result[arn] = metrics.copy()
-            result[arn]["models_used"] = set(metrics["models_used"])
+            # Merge per-model stats
+            for model_id, model_metrics in data["models"].items():
+                if model_id in result[arn]["models"]:
+                    result[arn]["models"][model_id]["input_tokens"] += model_metrics["input_tokens"]
+                    result[arn]["models"][model_id]["output_tokens"] += model_metrics["output_tokens"]
+                    result[arn]["models"][model_id]["cache_read_tokens"] += model_metrics["cache_read_tokens"]
+                    result[arn]["models"][model_id]["cache_write_tokens"] += model_metrics["cache_write_tokens"]
+                    result[arn]["models"][model_id]["request_count"] += model_metrics["request_count"]
+                else:
+                    result[arn]["models"][model_id] = model_metrics.copy()
+
+            # Merge totals
+            result[arn]["totals"]["total_input_tokens"] += data["totals"]["total_input_tokens"]
+            result[arn]["totals"]["total_output_tokens"] += data["totals"]["total_output_tokens"]
+            result[arn]["totals"]["cache_read_tokens"] += data["totals"]["cache_read_tokens"]
+            result[arn]["totals"]["cache_write_tokens"] += data["totals"]["cache_write_tokens"]
+            result[arn]["totals"]["request_count"] += data["totals"]["request_count"]
+            result[arn]["totals"]["models_used"] = result[arn]["totals"]["models_used"].union(
+                set(data["totals"]["models_used"])
+            )
 
     return result
 
@@ -268,36 +466,641 @@ def split_events_by_day(events: list) -> dict[str, list]:
     return dict(events_by_day)
 
 
-def write_csv(usage: dict, output_path: str):
-    """Write aggregated usage data to CSV file."""
+def format_ascii_table(usage: dict, show_costs: bool = False) -> str:
+    """
+    Format usage data as ASCII table with Unicode box-drawing characters.
+
+    Args:
+        usage: Dict mapping ARN to usage metrics (with per-model breakdown)
+        show_costs: Whether to include cost column
+
+    Returns:
+        Formatted table string
+    """
+    from textwrap import shorten
+
+    if not usage:
+        return "No usage data found."
+
+    # Prepare rows - show per-user per-model breakdown
+    rows = []
+    for arn in sorted(usage.keys()):
+        data = usage[arn]
+        username = extract_username(arn)
+
+        # Add rows for each model used by this user
+        for model_id in sorted(data["models"].keys()):
+            model_metrics = data["models"][model_id]
+            model_name = extract_model_name(model_id)
+
+            row = {
+                "row_type": "detail",
+                "username": username,
+                "user_arn": arn,
+                "model": model_name,
+                "input_tokens": model_metrics["input_tokens"],
+                "output_tokens": model_metrics["output_tokens"],
+                "cache_read_tokens": model_metrics["cache_read_tokens"],
+                "cache_write_tokens": model_metrics["cache_write_tokens"],
+                "request_count": model_metrics["request_count"],
+            }
+
+            if show_costs and "costs" in model_metrics:
+                costs = model_metrics["costs"]
+                row["total_cost"] = f"${costs['total_cost']:.2f}"
+
+            rows.append(row)
+
+        # Add summary row for this user (only if costs are shown)
+        if show_costs and "costs" in data["totals"]:
+            totals = data["totals"]
+            total_costs = totals["costs"]
+
+            summary_row = {
+                "row_type": "summary",
+                "username": "TOTAL",
+                "user_arn": arn,
+                "model": "All Models",
+                "input_tokens": totals["total_input_tokens"],
+                "output_tokens": totals["total_output_tokens"],
+                "cache_read_tokens": totals["cache_read_tokens"],
+                "cache_write_tokens": totals["cache_write_tokens"],
+                "request_count": totals["request_count"],
+                "total_cost": f"${total_costs['total_cost']:.2f}"
+            }
+
+            rows.append(summary_row)
+
+    # Add grand total row (only if costs are shown and there are multiple users)
+    if show_costs and len(usage) > 0:
+        grand_total = {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "request_count": 0,
+            "total_cost": 0.0
+        }
+
+        for arn in usage.keys():
+            data = usage[arn]
+            if "costs" in data["totals"]:
+                totals = data["totals"]
+                total_costs = totals["costs"]
+                grand_total["total_input_tokens"] += totals["total_input_tokens"]
+                grand_total["total_output_tokens"] += totals["total_output_tokens"]
+                grand_total["cache_read_tokens"] += totals["cache_read_tokens"]
+                grand_total["cache_write_tokens"] += totals["cache_write_tokens"]
+                grand_total["request_count"] += totals["request_count"]
+                grand_total["total_cost"] += total_costs["total_cost"]
+
+        grand_total_row = {
+            "row_type": "grand_total",
+            "username": "GRAND TOTAL",
+            "user_arn": "",
+            "model": "All Users, All Models",
+            "input_tokens": grand_total["total_input_tokens"],
+            "output_tokens": grand_total["total_output_tokens"],
+            "cache_read_tokens": grand_total["cache_read_tokens"],
+            "cache_write_tokens": grand_total["cache_write_tokens"],
+            "request_count": grand_total["request_count"],
+            "total_cost": f"${grand_total['total_cost']:.2f}"
+        }
+
+        rows.append(grand_total_row)
+
+    # Calculate column widths (excluding user_arn for table output)
+    col_widths = {
+        "username": max(len("Username"), max(len(r["username"]) for r in rows)),
+        "model": max(len("Model"), max(len(r["model"]) for r in rows)),
+        "input_tokens": max(len("Input Tokens"), max(len(str(r["input_tokens"])) for r in rows)),
+        "output_tokens": max(len("Output Tokens"), max(len(str(r["output_tokens"])) for r in rows)),
+        "cache_read_tokens": max(len("Cache Read"), max(len(str(r["cache_read_tokens"])) for r in rows)),
+        "cache_write_tokens": max(len("Cache Write"), max(len(str(r["cache_write_tokens"])) for r in rows)),
+        "request_count": max(len("Requests"), max(len(str(r["request_count"])) for r in rows)),
+    }
+
+    if show_costs:
+        col_widths["total_cost"] = max(
+            len("Total Cost"),
+            max(len(r.get("total_cost", "N/A")) for r in rows)
+        )
+
+    # Limit model column for readability
+    col_widths["model"] = min(col_widths["model"], 40)
+
+    # Build table with Unicode box-drawing characters
+    table_parts = []
+
+    # Top border
+    table_parts.append("┌" + "┬".join("─" * (w + 2) for w in col_widths.values()) + "┐")
+
+    # Header row
+    header_cells = [
+        "Username".ljust(col_widths["username"]),
+        "Model".ljust(col_widths["model"]),
+        "Input Tokens".rjust(col_widths["input_tokens"]),
+        "Output Tokens".rjust(col_widths["output_tokens"]),
+        "Cache Read".rjust(col_widths["cache_read_tokens"]),
+        "Cache Write".rjust(col_widths["cache_write_tokens"]),
+        "Requests".rjust(col_widths["request_count"]),
+    ]
+    if show_costs:
+        header_cells.append("Total Cost".rjust(col_widths["total_cost"]))
+    table_parts.append("│ " + " │ ".join(header_cells) + " │")
+
+    # Header separator
+    table_parts.append("├" + "┼".join("─" * (w + 2) for w in col_widths.values()) + "┤")
+
+    # Data rows
+    prev_username = None
+    prev_user_arn = None
+    for row in rows:
+        # Add separator before grand total row
+        if row["row_type"] == "grand_total":
+            table_parts.append("├" + "┼".join("─" * (w + 2) for w in col_widths.values()) + "┤")
+
+        # Truncate long values
+        model_display = shorten(row["model"], width=col_widths["model"], placeholder="...")
+
+        # Show username only for first model per user (detail rows)
+        # Always show for summary and grand_total rows
+        if row["row_type"] in ("summary", "grand_total"):
+            username_display = row["username"]
+        elif row["user_arn"] == prev_user_arn:
+            username_display = ""
+        else:
+            username_display = row["username"]
+            prev_user_arn = row["user_arn"]
+
+        data_cells = [
+            username_display.ljust(col_widths["username"]),
+            model_display.ljust(col_widths["model"]),
+            str(row["input_tokens"]).rjust(col_widths["input_tokens"]),
+            str(row["output_tokens"]).rjust(col_widths["output_tokens"]),
+            str(row["cache_read_tokens"]).rjust(col_widths["cache_read_tokens"]),
+            str(row["cache_write_tokens"]).rjust(col_widths["cache_write_tokens"]),
+            str(row["request_count"]).rjust(col_widths["request_count"]),
+        ]
+        if show_costs:
+            data_cells.append(
+                row.get("total_cost", "N/A").rjust(col_widths["total_cost"])
+            )
+
+        # Build row string
+        row_str = "│ " + " │ ".join(data_cells) + " │"
+
+        # Apply yellow color to summary and grand_total rows
+        if row["row_type"] in ("summary", "grand_total"):
+            row_str = f"{YELLOW}{row_str}{RESET}"
+
+        table_parts.append(row_str)
+
+        # Add separator after summary rows (except last row or if next is grand_total)
+        if row["row_type"] == "summary" and row != rows[-1]:
+            # Check if next row is grand_total
+            row_idx = rows.index(row)
+            if row_idx + 1 < len(rows) and rows[row_idx + 1]["row_type"] != "grand_total":
+                table_parts.append("├" + "┼".join("─" * (w + 2) for w in col_widths.values()) + "┤")
+
+    # Bottom border
+    table_parts.append("└" + "┴".join("─" * (w + 2) for w in col_widths.values()) + "┘")
+
+    return "\n".join(table_parts)
+
+
+def format_ascii_table_summary_only(usage: dict, show_costs: bool = False) -> str:
+    """
+    Format usage data as ASCII table showing only per-user totals (no per-model breakdown).
+
+    Args:
+        usage: Dict mapping ARN to usage metrics (with per-model breakdown)
+        show_costs: Whether to include cost column
+
+    Returns:
+        Formatted table string with one row per user + grand total
+    """
+    from textwrap import shorten
+
+    if not usage:
+        return "No usage data found."
+
+    # Prepare rows - one row per user (using totals only)
+    rows = []
+    for arn in sorted(usage.keys()):
+        data = usage[arn]
+        username = extract_username(arn)
+        totals = data["totals"]
+
+        # Get comma-separated list of model names
+        model_names = [extract_model_name(model_id) for model_id in sorted(data["models"].keys())]
+        models_display = ", ".join(model_names)
+
+        row = {
+            "row_type": "user_total",
+            "username": username,
+            "user_arn": arn,
+            "models": models_display,
+            "input_tokens": totals["total_input_tokens"],
+            "output_tokens": totals["total_output_tokens"],
+            "cache_read_tokens": totals["cache_read_tokens"],
+            "cache_write_tokens": totals["cache_write_tokens"],
+            "request_count": totals["request_count"],
+        }
+
+        if show_costs and "costs" in totals:
+            total_costs = totals["costs"]
+            row["total_cost"] = f"${total_costs['total_cost']:.2f}"
+
+        rows.append(row)
+
+    # Add grand total row (only if costs are shown)
+    if show_costs and len(usage) > 0:
+        grand_total = {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "request_count": 0,
+            "total_cost": 0.0
+        }
+
+        for arn in usage.keys():
+            data = usage[arn]
+            if "costs" in data["totals"]:
+                totals = data["totals"]
+                total_costs = totals["costs"]
+                grand_total["total_input_tokens"] += totals["total_input_tokens"]
+                grand_total["total_output_tokens"] += totals["total_output_tokens"]
+                grand_total["cache_read_tokens"] += totals["cache_read_tokens"]
+                grand_total["cache_write_tokens"] += totals["cache_write_tokens"]
+                grand_total["request_count"] += totals["request_count"]
+                grand_total["total_cost"] += total_costs["total_cost"]
+
+        grand_total_row = {
+            "row_type": "grand_total",
+            "username": "GRAND TOTAL",
+            "user_arn": "",
+            "models": "All Users, All Models",
+            "input_tokens": grand_total["total_input_tokens"],
+            "output_tokens": grand_total["total_output_tokens"],
+            "cache_read_tokens": grand_total["cache_read_tokens"],
+            "cache_write_tokens": grand_total["cache_write_tokens"],
+            "request_count": grand_total["request_count"],
+            "total_cost": f"${grand_total['total_cost']:.2f}"
+        }
+
+        rows.append(grand_total_row)
+
+    # Calculate column widths (models column shows comma-separated list)
+    col_widths = {
+        "username": max(len("Username"), max(len(r["username"]) for r in rows)),
+        "models": max(len("Models"), max(len(r["models"]) for r in rows)),
+        "input_tokens": max(len("Input Tokens"), max(len(str(r["input_tokens"])) for r in rows)),
+        "output_tokens": max(len("Output Tokens"), max(len(str(r["output_tokens"])) for r in rows)),
+        "cache_read_tokens": max(len("Cache Read"), max(len(str(r["cache_read_tokens"])) for r in rows)),
+        "cache_write_tokens": max(len("Cache Write"), max(len(str(r["cache_write_tokens"])) for r in rows)),
+        "request_count": max(len("Requests"), max(len(str(r["request_count"])) for r in rows)),
+    }
+
+    # Limit models column for readability
+    col_widths["models"] = min(col_widths["models"], 60)
+
+    if show_costs:
+        col_widths["total_cost"] = max(
+            len("Total Cost"),
+            max(len(r.get("total_cost", "N/A")) for r in rows)
+        )
+
+    # Build table with Unicode box-drawing characters
+    table_parts = []
+
+    # Top border
+    table_parts.append("┌" + "┬".join("─" * (w + 2) for w in col_widths.values()) + "┐")
+
+    # Header row (includes Models column)
+    header_cells = [
+        "Username".ljust(col_widths["username"]),
+        "Models".ljust(col_widths["models"]),
+        "Input Tokens".rjust(col_widths["input_tokens"]),
+        "Output Tokens".rjust(col_widths["output_tokens"]),
+        "Cache Read".rjust(col_widths["cache_read_tokens"]),
+        "Cache Write".rjust(col_widths["cache_write_tokens"]),
+        "Requests".rjust(col_widths["request_count"]),
+    ]
+    if show_costs:
+        header_cells.append("Total Cost".rjust(col_widths["total_cost"]))
+    table_parts.append("│ " + " │ ".join(header_cells) + " │")
+
+    # Header separator
+    table_parts.append("├" + "┼".join("─" * (w + 2) for w in col_widths.values()) + "┤")
+
+    # Data rows
+    for row in rows:
+        # Add separator before grand total
+        if row["row_type"] == "grand_total":
+            table_parts.append("├" + "┼".join("─" * (w + 2) for w in col_widths.values()) + "┤")
+
+        # Truncate models if too long
+        models_display = shorten(row["models"], width=col_widths["models"], placeholder="...")
+
+        data_cells = [
+            row["username"].ljust(col_widths["username"]),
+            models_display.ljust(col_widths["models"]),
+            str(row["input_tokens"]).rjust(col_widths["input_tokens"]),
+            str(row["output_tokens"]).rjust(col_widths["output_tokens"]),
+            str(row["cache_read_tokens"]).rjust(col_widths["cache_read_tokens"]),
+            str(row["cache_write_tokens"]).rjust(col_widths["cache_write_tokens"]),
+            str(row["request_count"]).rjust(col_widths["request_count"]),
+        ]
+        if show_costs:
+            data_cells.append(
+                row.get("total_cost", "N/A").rjust(col_widths["total_cost"])
+            )
+
+        # Build row string
+        row_str = "│ " + " │ ".join(data_cells) + " │"
+
+        # Apply yellow color to grand total row
+        if row["row_type"] == "grand_total":
+            row_str = f"{YELLOW}{row_str}{RESET}"
+
+        table_parts.append(row_str)
+
+    # Bottom border
+    table_parts.append("└" + "┴".join("─" * (w + 2) for w in col_widths.values()) + "┘")
+
+    return "\n".join(table_parts)
+
+
+def get_csv_filename_with_prefix(base_filename: str, start_date: str, end_date: str) -> str:
+    """
+    Add date range prefix to CSV filename.
+
+    Args:
+        base_filename: Original filename (e.g., "usage_report.csv")
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+
+    Returns:
+        Filename with date prefix (e.g., "2025-01-01_to_2025-01-31_usage_report.csv")
+    """
+    from pathlib import Path
+
+    path = Path(base_filename)
+    prefix = f"{start_date}_to_{end_date}_"
+    new_name = prefix + path.name
+
+    # Preserve directory path if present
+    if path.parent != Path("."):
+        return str(path.parent / new_name)
+    else:
+        return new_name
+
+
+def write_csv(usage: dict, output_path: str, show_costs: bool = False):
+    """Write per-user per-model usage data to CSV file."""
     fieldnames = [
         "user_arn",
         "username",
-        "total_input_tokens",
-        "total_output_tokens",
+        "model_id",
+        "model_name",
+        "input_tokens",
+        "output_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
         "request_count",
-        "models_used",
     ]
+
+    if show_costs:
+        fieldnames.extend([
+            "input_cost",
+            "output_cost",
+            "cache_read_cost",
+            "cache_write_cost",
+            "total_cost"
+        ])
 
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for arn, metrics in sorted(usage.items()):
-            writer.writerow(
-                {
+        for arn in sorted(usage.keys()):
+            data = usage[arn]
+            username = extract_username(arn)
+
+            # Write one row per model
+            for model_id in sorted(data["models"].keys()):
+                model_metrics = data["models"][model_id]
+                model_name = extract_model_name(model_id)
+
+                row = {
                     "user_arn": arn,
-                    "username": extract_username(arn),
-                    "total_input_tokens": metrics["total_input_tokens"],
-                    "total_output_tokens": metrics["total_output_tokens"],
-                    "cache_read_tokens": metrics["cache_read_tokens"],
-                    "cache_write_tokens": metrics["cache_write_tokens"],
-                    "request_count": metrics["request_count"],
-                    "models_used": ",".join(sorted(metrics["models_used"])),
+                    "username": username,
+                    "model_id": model_id,
+                    "model_name": model_name,
+                    "input_tokens": model_metrics["input_tokens"],
+                    "output_tokens": model_metrics["output_tokens"],
+                    "cache_read_tokens": model_metrics["cache_read_tokens"],
+                    "cache_write_tokens": model_metrics["cache_write_tokens"],
+                    "request_count": model_metrics["request_count"],
                 }
-            )
+
+                if show_costs and "costs" in model_metrics:
+                    costs = model_metrics["costs"]
+                    row.update({
+                        "input_cost": f"{costs['input_cost']:.4f}",
+                        "output_cost": f"{costs['output_cost']:.4f}",
+                        "cache_read_cost": f"{costs['cache_read_cost']:.4f}",
+                        "cache_write_cost": f"{costs['cache_write_cost']:.4f}",
+                        "total_cost": f"{costs['total_cost']:.4f}"
+                    })
+
+                writer.writerow(row)
+
+            # Write summary row for this user (only if costs are shown)
+            if show_costs and "costs" in data["totals"]:
+                totals = data["totals"]
+                total_costs = totals["costs"]
+
+                summary_row = {
+                    "user_arn": arn,
+                    "username": f"TOTAL: {username}",
+                    "model_id": "ALL_MODELS",
+                    "model_name": "All Models",
+                    "input_tokens": totals["total_input_tokens"],
+                    "output_tokens": totals["total_output_tokens"],
+                    "cache_read_tokens": totals["cache_read_tokens"],
+                    "cache_write_tokens": totals["cache_write_tokens"],
+                    "request_count": totals["request_count"],
+                    "input_cost": f"{total_costs['total_input_cost']:.4f}",
+                    "output_cost": f"{total_costs['total_output_cost']:.4f}",
+                    "cache_read_cost": f"{total_costs['total_cache_read_cost']:.4f}",
+                    "cache_write_cost": f"{total_costs['total_cache_write_cost']:.4f}",
+                    "total_cost": f"{total_costs['total_cost']:.4f}"
+                }
+
+                writer.writerow(summary_row)
+
+        # Write grand total row (only if costs are shown)
+        if show_costs:
+            grand_total = {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "request_count": 0,
+                "total_input_cost": 0.0,
+                "total_output_cost": 0.0,
+                "total_cache_read_cost": 0.0,
+                "total_cache_write_cost": 0.0,
+                "total_cost": 0.0
+            }
+
+            for arn in sorted(usage.keys()):
+                data = usage[arn]
+                if "costs" in data["totals"]:
+                    totals = data["totals"]
+                    total_costs = totals["costs"]
+                    grand_total["total_input_tokens"] += totals["total_input_tokens"]
+                    grand_total["total_output_tokens"] += totals["total_output_tokens"]
+                    grand_total["cache_read_tokens"] += totals["cache_read_tokens"]
+                    grand_total["cache_write_tokens"] += totals["cache_write_tokens"]
+                    grand_total["request_count"] += totals["request_count"]
+                    grand_total["total_input_cost"] += total_costs["total_input_cost"]
+                    grand_total["total_output_cost"] += total_costs["total_output_cost"]
+                    grand_total["total_cache_read_cost"] += total_costs["total_cache_read_cost"]
+                    grand_total["total_cache_write_cost"] += total_costs["total_cache_write_cost"]
+                    grand_total["total_cost"] += total_costs["total_cost"]
+
+            grand_total_row = {
+                "user_arn": "",
+                "username": "GRAND TOTAL",
+                "model_id": "ALL_USERS_ALL_MODELS",
+                "model_name": "All Users, All Models",
+                "input_tokens": grand_total["total_input_tokens"],
+                "output_tokens": grand_total["total_output_tokens"],
+                "cache_read_tokens": grand_total["cache_read_tokens"],
+                "cache_write_tokens": grand_total["cache_write_tokens"],
+                "request_count": grand_total["request_count"],
+                "input_cost": f"{grand_total['total_input_cost']:.4f}",
+                "output_cost": f"{grand_total['total_output_cost']:.4f}",
+                "cache_read_cost": f"{grand_total['total_cache_read_cost']:.4f}",
+                "cache_write_cost": f"{grand_total['total_cache_write_cost']:.4f}",
+                "total_cost": f"{grand_total['total_cost']:.4f}"
+            }
+
+            writer.writerow(grand_total_row)
+
+    print(f"Report written to {output_path}")
+
+
+def write_csv_summary_only(usage: dict, output_path: str, show_costs: bool = False):
+    """Write per-user totals (no per-model breakdown) to CSV file."""
+    fieldnames = [
+        "user_arn",
+        "username",
+        "models",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "request_count",
+    ]
+
+    if show_costs:
+        fieldnames.extend([
+            "input_cost",
+            "output_cost",
+            "cache_read_cost",
+            "cache_write_cost",
+            "total_cost"
+        ])
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for arn in sorted(usage.keys()):
+            data = usage[arn]
+            username = extract_username(arn)
+            totals = data["totals"]
+
+            # Get comma-separated list of model names
+            model_names = [extract_model_name(model_id) for model_id in sorted(data["models"].keys())]
+            models_display = ", ".join(model_names)
+
+            row = {
+                "user_arn": arn,
+                "username": username,
+                "models": models_display,
+                "input_tokens": totals["total_input_tokens"],
+                "output_tokens": totals["total_output_tokens"],
+                "cache_read_tokens": totals["cache_read_tokens"],
+                "cache_write_tokens": totals["cache_write_tokens"],
+                "request_count": totals["request_count"],
+            }
+
+            if show_costs and "costs" in totals:
+                total_costs = totals["costs"]
+                row.update({
+                    "input_cost": f"{total_costs['total_input_cost']:.4f}",
+                    "output_cost": f"{total_costs['total_output_cost']:.4f}",
+                    "cache_read_cost": f"{total_costs['total_cache_read_cost']:.4f}",
+                    "cache_write_cost": f"{total_costs['total_cache_write_cost']:.4f}",
+                    "total_cost": f"{total_costs['total_cost']:.4f}"
+                })
+
+            writer.writerow(row)
+
+        # Write grand total row (only if costs are shown)
+        if show_costs:
+            grand_total = {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "request_count": 0,
+                "total_input_cost": 0.0,
+                "total_output_cost": 0.0,
+                "total_cache_read_cost": 0.0,
+                "total_cache_write_cost": 0.0,
+                "total_cost": 0.0
+            }
+
+            for arn in sorted(usage.keys()):
+                data = usage[arn]
+                if "costs" in data["totals"]:
+                    totals = data["totals"]
+                    total_costs = totals["costs"]
+                    grand_total["total_input_tokens"] += totals["total_input_tokens"]
+                    grand_total["total_output_tokens"] += totals["total_output_tokens"]
+                    grand_total["cache_read_tokens"] += totals["cache_read_tokens"]
+                    grand_total["cache_write_tokens"] += totals["cache_write_tokens"]
+                    grand_total["request_count"] += totals["request_count"]
+                    grand_total["total_input_cost"] += total_costs["total_input_cost"]
+                    grand_total["total_output_cost"] += total_costs["total_output_cost"]
+                    grand_total["total_cache_read_cost"] += total_costs["total_cache_read_cost"]
+                    grand_total["total_cache_write_cost"] += total_costs["total_cache_write_cost"]
+                    grand_total["total_cost"] += total_costs["total_cost"]
+
+            grand_total_row = {
+                "user_arn": "",
+                "username": "GRAND TOTAL",
+                "models": "All Users, All Models",
+                "input_tokens": grand_total["total_input_tokens"],
+                "output_tokens": grand_total["total_output_tokens"],
+                "cache_read_tokens": grand_total["cache_read_tokens"],
+                "cache_write_tokens": grand_total["cache_write_tokens"],
+                "request_count": grand_total["request_count"],
+                "input_cost": f"{grand_total['total_input_cost']:.4f}",
+                "output_cost": f"{grand_total['total_output_cost']:.4f}",
+                "cache_read_cost": f"{grand_total['total_cache_read_cost']:.4f}",
+                "cache_write_cost": f"{grand_total['total_cache_write_cost']:.4f}",
+                "total_cost": f"{grand_total['total_cost']:.4f}"
+            }
+
+            writer.writerow(grand_total_row)
 
     print(f"Report written to {output_path}")
 
@@ -312,6 +1115,11 @@ def main():
 
     if args.clear_all_cache:
         clear_all_cache()
+        return
+
+    if args.clear_pricing_cache:
+        from pricing_manager import clear_pricing_cache
+        clear_pricing_cache()
         return
 
     # Validate required arguments for normal operation
@@ -472,10 +1280,51 @@ def main():
         print("No valid Bedrock usage entries found from any source.")
         sys.exit(0)
 
-    print(f"Total usage data for {len(all_usage)} users")
+    print(f"Total usage data for {len(all_usage)} users\n")
 
-    # Write CSV
-    write_csv(all_usage, args.output)
+    # Calculate costs if requested
+    if args.show_costs:
+        print("Fetching pricing data...")
+        from pricing_manager import get_pricing_data, calculate_costs
+
+        try:
+            pricing_data, model_id_mapping = get_pricing_data(
+                session,
+                pricing_region=args.pricing_region,
+                force_refresh=args.refresh_pricing,
+                ttl_hours=args.pricing_cache_ttl
+            )
+
+            if pricing_data:
+                print(f"Loaded pricing for {len(pricing_data)} models")
+                all_usage = calculate_costs(all_usage, pricing_data, model_id_mapping, args.region)
+            else:
+                print("Warning: Could not load pricing data. Costs will not be shown.")
+                args.show_costs = False
+        except Exception as e:
+            print(f"Warning: Error loading pricing data: {e}")
+            print("Continuing without cost calculation.")
+            args.show_costs = False
+
+    # Output based on flags
+    if args.csv:
+        # Write CSV with date-prefixed filename
+        csv_filename = get_csv_filename_with_prefix(
+            args.output,
+            args.start_date,
+            args.end_date
+        )
+        if args.summary_only:
+            write_csv_summary_only(all_usage, csv_filename, show_costs=args.show_costs)
+        else:
+            write_csv(all_usage, csv_filename, show_costs=args.show_costs)
+    else:
+        # Print ASCII table to stdout
+        if args.summary_only:
+            table = format_ascii_table_summary_only(all_usage, show_costs=args.show_costs)
+        else:
+            table = format_ascii_table(all_usage, show_costs=args.show_costs)
+        print(table)
 
 
 if __name__ == "__main__":
