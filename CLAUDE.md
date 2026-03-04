@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-CLI tool that queries AWS CloudWatch logs from Bedrock logging and generates CSV usage reports per IAM user with per-model breakdown. Each report row shows usage statistics for a specific user-model combination, enabling accurate cost calculation since pricing varies by model.
+CLI tool suite for AWS Bedrock usage reporting and log analysis:
+- **bedrock_usage_report.py** — Generates CSV/ASCII usage reports per IAM user with per-model breakdown for cost calculation.
+- **bedrock_download_logs.py** — Downloads full invocation logs (prompts, responses, metadata) as JSONL with user filtering.
 
 ## Setup
 
@@ -213,6 +215,69 @@ Each day is cached independently in its own file. This means:
   }
 }
 ```
+
+## Downloading Full Logs (bedrock_download_logs.py)
+
+Downloads complete Bedrock invocation logs (prompts, responses, all metadata) as JSONL. Shares the same cache infrastructure as the usage report script.
+
+### Basic usage - JSONL to stdout
+```bash
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile>
+```
+
+### Filter by users
+```bash
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --users alice,bob
+```
+
+### Save to file (auto-prefixed with date range)
+```bash
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --output logs.jsonl
+# Creates: 2025-01-01_to_2025-01-31_logs.jsonl
+```
+
+### Field selection
+```bash
+# Include only specific fields
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --fields timestamp,modelId,identity,input
+
+# Exclude fields
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --exclude-fields schemaType,schemaVersion
+```
+
+### JSONL output format
+Each line is a JSON object with the original AWS log structure plus enrichments (`identity.username`, `modelName`):
+```json
+{
+  "timestamp": "2026-02-10T00:00:00Z",
+  "modelId": "arn:aws:bedrock:...",
+  "modelName": "Claude Sonnet 4.5",
+  "identity": {"arn": "arn:aws:iam::123:user/alice", "username": "alice"},
+  "input": {"inputTokenCount": 18034, "inputBodyJson": {...}},
+  "output": {"outputTokenCount": 667, "outputBodyJson": {...}}
+}
+```
+
+All progress/status messages go to stderr; JSONL output goes to stdout, so piping works cleanly.
 
 ## AWS Requirements
 
