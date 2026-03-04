@@ -1,8 +1,9 @@
-# AWS Bedrock Usage Report
+# AWS Bedrock Usage
 
-CLI tool that queries AWS Bedrock invocation logs (from S3 or CloudWatch) and generates per-user usage reports with per-model token breakdown and estimated costs.
+CLI tools for AWS Bedrock usage reporting and log analysis.
 
-Each report row shows a specific user-model combination with input/output/cache tokens and request counts, enabling accurate cost attribution since Bedrock pricing varies by model.
+- **Usage reports** (`bedrock_usage_report.py`): Per-user usage reports with per-model token breakdown and estimated costs. Each row shows a user-model combination with input/output/cache tokens and request counts.
+- **Full log download** (`bedrock_download_logs.py`): Download complete invocation logs (prompts, responses, all metadata) as JSONL with user filtering and field selection.
 
 ## Features
 
@@ -13,6 +14,7 @@ Each report row shows a specific user-model combination with input/output/cache 
 - **Flexible output**: Formatted ASCII table (default) or CSV export
 - **Smart caching**: Two-layer per-day cache (summary + full) for fast repeat queries and incremental date range expansion
 - **Cache token tracking**: Tracks cache read/write tokens separately for prompt caching visibility
+- **Full log download**: Export complete invocation logs as JSONL with user filtering and field selection
 
 ## Prerequisites
 
@@ -156,6 +158,68 @@ python bedrock_usage_report.py --clear-all-cache
 python bedrock_usage_report.py --clear-pricing-cache
 ```
 
+## Downloading full logs
+
+`bedrock_download_logs.py` downloads complete Bedrock invocation logs as JSONL. It shares the same cache as the usage report, so previously fetched days are reused automatically.
+
+### Basic download (JSONL to stdout)
+
+```bash
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile>
+```
+
+### Filter by users
+
+```bash
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --users alice,bob
+```
+
+### Save to file
+
+```bash
+# Creates: 2025-01-01_to_2025-01-31_logs.jsonl
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --output logs.jsonl
+
+# With user filter: 2025-01-01_to_2025-01-31_alice_bob_logs.jsonl
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --users alice,bob \
+  --output logs.jsonl
+```
+
+### Field selection
+
+```bash
+# Include only specific fields
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --fields timestamp,modelId,identity,input
+
+# Exclude fields
+python bedrock_download_logs.py \
+  --start-date 2025-01-01 \
+  --end-date 2025-01-31 \
+  --profile <aws-profile> \
+  --exclude-fields schemaType,schemaVersion
+```
+
+Each JSONL line contains the original AWS log structure enriched with `identity.username` and `modelName`. All status messages go to stderr, so piping works cleanly (e.g., `| jq .`, `| wc -l`).
+
 ## How caching works
 
 Each day is cached independently:
@@ -174,7 +238,8 @@ Each day is cached independently:
 ## Project structure
 
 ```
-bedrock_usage_report.py   # Main CLI and report generation
+bedrock_usage_report.py   # Usage report CLI (ASCII table / CSV)
+bedrock_download_logs.py  # Full log download CLI (JSONL)
 cache_manager.py          # Two-layer per-day caching (full + summary)
 pricing_manager.py        # AWS Pricing API queries, caching, and cost calculation
 s3_log_source.py          # S3 log fetching, decompression, and parsing
